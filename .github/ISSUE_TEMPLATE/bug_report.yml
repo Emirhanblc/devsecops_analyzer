@@ -1,0 +1,38 @@
+name: Bug report
+description: The scanner, dashboard, or CI workflow did not behave as documented.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. `test_vuln.py` is an intentional SQL injection fixture. A finding there is expected, and the fixture CI job is supposed to pass only when that finding appears.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. docker compose up --build
+        2. Open http://localhost:8080
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Output of git rev-parse --short HEAD
+      placeholder: abc1234
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste the relevant output. Remove API keys and passwords first.
+      render: text

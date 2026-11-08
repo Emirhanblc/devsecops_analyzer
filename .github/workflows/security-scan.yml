@@ -1,8 +1,10 @@
 # =============================================================================
 # GitHub Actions iş akışı (workflow)
-# Bu dosya, her kod gönderiminde güvenlik taramasını GitHub sunucularında
-# otomatik olarak çalıştırır. Yerelde "python scan.py" demek yerine
-# pipeline bu işi sizin yerinize yapar.
+# Her push ve pull request iki iş çalıştırır:
+#   1. security_scan     — app/ ve scan.py. Bulgu varsa kırmızı.
+#   2. fixture_detection — yalnızca test_vuln.py. SQL Injection bulunursa yeşil.
+# İkinci iş birincinin bitmesini bekler. İkisi aynı anda Groq'a giderse
+# dakikalık token limiti dolup 429 üretir.
 # =============================================================================
 
 # name: GitHub arayüzünde (Actions sekmesinde) görünen iş akışı başlığıdır.
@@ -25,6 +27,7 @@ permissions:
 jobs:
   # security_scan: Bu işin benzersiz kimliğidir. Loglarda bu isimle görünür.
   security_scan:
+    name: Uygulama kodu taraması
     # runs-on: İşin hangi işletim sisteminde çalışacağını seçer.
     # ubuntu-latest 2026'da Ubuntu 26'ya geçti; Python 3.10/3.11 indirmesi
     # 504 hatası verebiliyor. 24.04 sabittir ve tool cache'inde Python vardır.
@@ -56,7 +59,31 @@ jobs:
       # env: Bu adıma özel ortam değişkenleridir.
       # secrets.GROQ_API_KEY, GitHub deposundaki gizli değişkenden gelir.
       # Anahtar asla YAML içine yazılmaz; Actions loglarında da gizlenir.
+      # python scan.py uygulama koduna bakar. test_vuln.py bu adımda yoktur.
       - name: Güvenlik Taramasını Çalıştır
         run: python scan.py
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+
+  # Kasıtlı SQL Injection örneği. Bulgu bu işin başarı koşuludur.
+  fixture_detection:
+    name: SQL Injection örneği yakalanıyor
+    needs: security_scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Kodları Çek
+        uses: actions/checkout@v7
+
+      - name: Python Ortamını Kur
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Bağımlılıkları Yükle
+        run: pip install -r requirements.txt
+
+      - name: Kasıtlı SQL Injection örneğini tara
+        run: python scan.py --fixture
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
