@@ -24,8 +24,10 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # Groq'a aynı anda gidecek istek sayısı ve istekler arası bekleme.
-MAX_CONCURRENT = 5
-REQUEST_DELAY_SECONDS = 1
+# Groq on-demand katmanı dakikada yaklaşık 7000 girdi tokeni veriyor.
+# Beş paralel istek bu limiti aşıp 429 üretiyor; iki istek sınırın altında kalır.
+MAX_CONCURRENT = 2
+REQUEST_DELAY_SECONDS = 2
 
 
 def fail(message: str, code: int = 2) -> None:
@@ -70,7 +72,7 @@ def github_line(value: object) -> str:
     return digits or "1"
 
 
-async def run_scan() -> list[dict]:
+async def run_scan() -> tuple[list[dict], list[str]]:
     """Kaynak dosyaları parçalayıp Groq analizörüne gönderir."""
     from app.services.analyzer import analyze_code_chunk_async
     from app.services.parser import chunk_code
@@ -95,12 +97,16 @@ async def run_scan() -> list[dict]:
         for code_part in chunk_code(file_content):
             tasks.append(analyze_with_semaphore(code_part, file_name))
 
-    results = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     findings: list[dict] = []
+    errors: list[str] = []
     for item in results:
-        findings.extend(item)
-    return findings
+        if isinstance(item, BaseException):
+            errors.append(str(item))
+        else:
+            findings.extend(item)
+    return findings, errors
 
 
 def print_report(findings: list[dict]) -> None:
@@ -140,14 +146,29 @@ def print_report(findings: list[dict]) -> None:
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     if not os.getenv("GROQ_API_KEY"):
         fail(
             "GROQ_API_KEY ortam değişkeni yok. "
             "Yerelde .env dosyasını, GitHub'da ise repository secret'ını kontrol edin."
         )
 
-    findings = asyncio.run(run_scan())
+    findings, errors = asyncio.run(run_scan())
     print_report(findings)
+
+    if errors:
+        print(
+            f"Pipeline başarısız: {len(errors)} analiz çağrısı tamamlanamadı.",
+            flush=True,
+        )
+        for message in errors:
+            print(f"  - {message}", flush=True)
+            if os.getenv("GITHUB_ACTIONS") == "true":
+                print(f"::error::{message}", flush=True)
+        raise SystemExit(2)
 
     if findings:
         print(

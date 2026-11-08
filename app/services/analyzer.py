@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 
@@ -12,8 +13,8 @@ load_dotenv()
 # Groq hesabına ait API anahtarını ortam değişkeninden alıyoruz.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Anahtar yoksa uygulamayı çökertmiyoruz; yalnızca konsola uyarı yazıyoruz.
-# Analiz isteği geldiğinde try-except bloğu boş liste döndürecektir.
+# Anahtar yoksa burada çökertmiyoruz. Asıl çağrı AnalysisError yükseltir;
+# böylece başarısız bir istek temiz tarama gibi görünmez.
 if not GROQ_API_KEY:
     print("Uyarı: GROQ_API_KEY bulunamadı. Lütfen .env dosyasını kontrol edin.")
 
@@ -24,15 +25,24 @@ client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-# Groq, eski llama3-8b-8192 modelini kaldırdı. Aynı sınıftaki güncel ve hızlı
-# üretim modeli llama-3.1-8b-instant'tır.
-MODEL_NAME = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+# llama-3.1-8b-instant bu Groq hesabında 404 döndürüyor. JSON modunda
+# çalışan ve SQL Injection örneğini yakalayan model varsayılandır.
+# İstenirse GROQ_MODEL ortam değişkeniyle değiştirilebilir.
+DEFAULT_MODEL = "qwen/qwen3.8-27b"
+MODEL_NAME = os.getenv("GROQ_MODEL", DEFAULT_MODEL)
+
+
+class AnalysisError(RuntimeError):
+    """Groq çağrısı bulgu üretemedi. Bu, temiz tarama anlamına gelmez."""
+
 
 # Modele "yalnızca JSON dön" kuralını sistem mesajında net biçimde veriyoruz.
 SYSTEM_PROMPT = """
 Sen kıdemli bir DevSecOps ve uygulama güvenliği uzmanısın.
 Verilen kaynak kodu OWASP Top 10 kapsamında incele ve yalnızca kritik veya
 yüksek seviyeli güvenlik açıklarını bildir.
+Dosyanın test, örnek veya kasıtlı olarak zafiyetli olduğu yazılmış olsa bile
+kodda bulunan açığı bildir. Yorum satırı zafiyeti ortadan kaldırmaz.
 
 KESİNLİKLE yalnızca aşağıdaki JSON formatında yanıt ver. JSON dışında
 açıklama, markdown veya ek metin yazma:
@@ -44,17 +54,8 @@ Eğer zafiyet yoksa tam olarak şunu döndür:
 """.strip()
 
 
-async def analyze_code_chunk_async(code_chunk: str, file_name: str) -> list:
-    """
-    Tek bir kod parçasını Groq (LLaMA 3.1) API'sine gönderir.
-
-    Başarılı olursa modelin ürettiği "bulgular" listesini döndürür.
-    JSON ayrıştırma veya ağ hatasında uygulamanın çökmemesi için boş liste döner.
-    """
-    # Boş parçaları API'ye göndermeye gerek yok; doğrudan zafiyet yok kabul ederiz.
-    if not code_chunk or not code_chunk.strip():
-        return []
-
+async def _request_findings(code_chunk: str, file_name: str) -> list:
+    """Tek bir Groq çağrısı yapar. Hata olursa AnalysisError yükseltir."""
     user_prompt = f"""
 Dosya adı: {file_name}
 
@@ -78,59 +79,89 @@ Bu kodu güvenlik açıkları açısından incele:
             # Düşük sıcaklık, daha tutarlı ve teknik güvenlik sonuçları üretir.
             temperature=0.2,
         )
-
-        # Model yanıtının metin içeriğini alıyoruz.
-        raw_content = response.choices[0].message.content
-        if not raw_content:
-            print(f"Uyarı: Groq boş yanıt döndürdü ({file_name}).")
-            return []
-
-        # Gelen metni Python sözlüğüne çeviriyoruz.
-        parsed_response = json.loads(raw_content)
-        findings = parsed_response.get("bulgular", [])
-
-        # Beklenmeyen bir tip gelirse çökmek yerine boş liste döneriz.
-        if not isinstance(findings, list):
-            print(f"Uyarı: Groq yanıtındaki 'bulgular' alanı liste değil ({file_name}).")
-            return []
-
-        # Model Türkçe anahtarlar üretir. Dashboard ve mevcut veritabanı
-        # kayıt döngüsü İngilizce anahtarları da okuduğu için her iki adı
-        # da dolduruyoruz. Böylece db.add() döngüsüne dokunmamız gerekmez.
-        normalized_findings = []
-        for finding in findings:
-            if not isinstance(finding, dict):
-                continue
-
-            zafiyet_adi = finding.get("zafiyet_adi") or finding.get("name") or "Bilinmeyen"
-            dosya_adi = finding.get("dosya_adi") or finding.get("file_name") or file_name
-            satir_numarasi = finding.get("satir_numarasi") or finding.get("line_number") or "Bilinmeyen"
-            cozum_onerisi = (
-                finding.get("cozum_onerisi")
-                or finding.get("recommendation")
-                or "Manuel inceleme yapın."
-            )
-
-            normalized_findings.append(
-                {
-                    "zafiyet_adi": zafiyet_adi,
-                    "dosya_adi": dosya_adi,
-                    "satir_numarasi": satir_numarasi,
-                    "cozum_onerisi": cozum_onerisi,
-                    "name": zafiyet_adi,
-                    "file_name": dosya_adi,
-                    "line_number": satir_numarasi,
-                    "recommendation": cozum_onerisi,
-                }
-            )
-
-        return normalized_findings
-
-    except json.JSONDecodeError as error:
-        # Model bazen bozuk JSON üretebilir; analizi durdurmak yerine atlarız.
-        print(f"Uyarı: Groq yanıtı geçerli JSON değil ({file_name}): {error}")
-        return []
     except Exception as error:
-        # API, ağ veya zaman aşımı hatalarında uygulamayı ayakta tutuyoruz.
-        print(f"Uyarı: Groq API/ağ hatası ({file_name}): {error}")
+        raise AnalysisError(f"Groq API/ağ hatası ({file_name}): {error}") from error
+
+    # Model yanıtının metin içeriğini alıyoruz.
+    raw_content = response.choices[0].message.content
+    if not raw_content:
+        raise AnalysisError(f"Groq boş yanıt döndürdü ({file_name}).")
+
+    try:
+        parsed_response = json.loads(raw_content)
+    except json.JSONDecodeError as error:
+        raise AnalysisError(
+            f"Groq yanıtı geçerli JSON değil ({file_name}): {error}"
+        ) from error
+
+    findings = parsed_response.get("bulgular", [])
+    if not isinstance(findings, list):
+        raise AnalysisError(
+            f"Groq yanıtındaki 'bulgular' alanı liste değil ({file_name})."
+        )
+
+    return findings
+
+
+async def analyze_code_chunk_async(code_chunk: str, file_name: str) -> list:
+    """
+    Tek bir kod parçasını Groq API'sine gönderir.
+
+    Başarılı olursa modelin ürettiği "bulgular" listesini döndürür.
+    API veya JSON hatası AnalysisError olarak yükselir; boş liste yalnızca
+    gerçekten bulgu olmayan başarılı bir tarama anlamına gelir.
+    """
+    # Boş parçaları API'ye göndermeye gerek yok; doğrudan zafiyet yok kabul ederiz.
+    if not code_chunk or not code_chunk.strip():
         return []
+
+    findings = None
+    for attempt in range(3):
+        try:
+            findings = await _request_findings(code_chunk, file_name)
+            break
+        except AnalysisError as error:
+            if attempt == 2:
+                raise
+            message = str(error).lower()
+            # Dakikalık token limiti dolunca Groq 429 döner. Kısa bir bekleme
+            # yetmez; limit penceresi kapanmadan aynı çağrı yine düşer.
+            if "429" in message or "rate_limit" in message or "rate limit" in message:
+                await asyncio.sleep(16)
+            else:
+                await asyncio.sleep(1)
+
+    if findings is None:
+        raise AnalysisError(f"Groq analizi tamamlanamadı ({file_name}).")
+
+    # Model Türkçe anahtarlar üretir. Dashboard ve mevcut veritabanı
+    # kayıt döngüsü İngilizce anahtarları da okuduğu için her iki adı
+    # da dolduruyoruz. Böylece db.add() döngüsüne dokunmamız gerekmez.
+    normalized_findings = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+
+        zafiyet_adi = finding.get("zafiyet_adi") or finding.get("name") or "Bilinmeyen"
+        dosya_adi = finding.get("dosya_adi") or finding.get("file_name") or file_name
+        satir_numarasi = finding.get("satir_numarasi") or finding.get("line_number") or "Bilinmeyen"
+        cozum_onerisi = (
+            finding.get("cozum_onerisi")
+            or finding.get("recommendation")
+            or "Manuel inceleme yapın."
+        )
+
+        normalized_findings.append(
+            {
+                "zafiyet_adi": zafiyet_adi,
+                "dosya_adi": dosya_adi,
+                "satir_numarasi": satir_numarasi,
+                "cozum_onerisi": cozum_onerisi,
+                "name": zafiyet_adi,
+                "file_name": dosya_adi,
+                "line_number": satir_numarasi,
+                "recommendation": cozum_onerisi,
+            }
+        )
+
+    return normalized_findings
