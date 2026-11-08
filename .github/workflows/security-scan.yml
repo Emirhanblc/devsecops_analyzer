@@ -18,9 +18,13 @@ on:
   # pull_request: Bir pull request açıldığında veya güncellendiğinde tetiklenir.
   pull_request:
 
-# Depoyu okumak için yeterli izin; gizli anahtarlar yine secrets ile gelir.
+# contents: kodu okur. security-events: SARIF'i Code Scanning'e yazar.
+# pull-requests: tarama özetini PR yorumu olarak ekler veya günceller.
+# Gizli anahtarlar yine secrets ile gelir.
 permissions:
   contents: read
+  security-events: write
+  pull-requests: write
 
 # jobs: İş akışındaki işleri (job) listeler. Bir iş, bir sanal makinede
 # sırayla çalışan adımlar bütünüdür.
@@ -59,11 +63,24 @@ jobs:
       # env: Bu adıma özel ortam değişkenleridir.
       # secrets.GROQ_API_KEY, GitHub deposundaki gizli değişkenden gelir.
       # Anahtar asla YAML içine yazılmaz; Actions loglarında da gizlenir.
+      # GITHUB_TOKEN, PR yorumu için Actions'ın ürettiği kısa ömürlü tokendir.
       # python scan.py uygulama koduna bakar. test_vuln.py bu adımda yoktur.
+      # --export-sarif, Security sekmesi için results.sarif üretir.
+      # --comment-pr, pull_request olayında özet yorum yazar.
       - name: Güvenlik Taramasını Çalıştır
-        run: python scan.py
+        run: python scan.py --export-sarif results.sarif --comment-pr
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tarama kırmızı olsa bile (çıkış 1) SARIF yüklenir; Security sekmesi
+      # bulguları görsün. Dosya yoksa (çıkış 2, taramadan önce kırılma) atlanır.
+      # Fixture işi kasıtlı SQL Injection içerir; bu yüzden SARIF yüklemez.
+      - name: SARIF yükle
+        if: always() && hashFiles('results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: results.sarif
 
   # Kasıtlı SQL Injection örneği. Bulgu bu işin başarı koşuludur.
   fixture_detection:

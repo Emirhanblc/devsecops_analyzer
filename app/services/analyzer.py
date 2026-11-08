@@ -36,18 +36,27 @@ class AnalysisError(RuntimeError):
     """Groq çağrısı bulgu üretemedi. Bu, temiz tarama anlamına gelmez."""
 
 
+def _normalize_severity(value: object) -> str:
+    """Modelin seviye alanını critical veya high olarak sabitler."""
+    text = str(value or "").strip().lower()
+    if text == "critical":
+        return "critical"
+    return "high"
+
+
 # Modele "yalnızca JSON dön" kuralını sistem mesajında net biçimde veriyoruz.
 SYSTEM_PROMPT = """
 Sen kıdemli bir DevSecOps ve uygulama güvenliği uzmanısın.
 Verilen kaynak kodu OWASP Top 10 kapsamında incele ve yalnızca kritik veya
 yüksek seviyeli güvenlik açıklarını bildir.
+seviye alanı yalnızca "critical" veya "high" olabilir.
 Dosyanın test, örnek veya kasıtlı olarak zafiyetli olduğu yazılmış olsa bile
 kodda bulunan açığı bildir. Yorum satırı zafiyeti ortadan kaldırmaz.
 
 KESİNLİKLE yalnızca aşağıdaki JSON formatında yanıt ver. JSON dışında
 açıklama, markdown veya ek metin yazma:
 
-{"bulgular": [{"zafiyet_adi": "...", "dosya_adi": "...", "satir_numarasi": "...", "cozum_onerisi": "..."}]}
+{"bulgular": [{"zafiyet_adi": "...", "dosya_adi": "...", "satir_numarasi": "...", "seviye": "critical", "cozum_onerisi": "..."}]}
 
 Eğer zafiyet yoksa tam olarak şunu döndür:
 {"bulgular": []}
@@ -150,16 +159,21 @@ async def analyze_code_chunk_async(code_chunk: str, file_name: str) -> list:
             or finding.get("recommendation")
             or "Manuel inceleme yapın."
         )
+        seviye = _normalize_severity(
+            finding.get("seviye") or finding.get("severity")
+        )
 
         normalized_findings.append(
             {
                 "zafiyet_adi": zafiyet_adi,
                 "dosya_adi": dosya_adi,
                 "satir_numarasi": satir_numarasi,
+                "seviye": seviye,
                 "cozum_onerisi": cozum_onerisi,
                 "name": zafiyet_adi,
                 "file_name": dosya_adi,
                 "line_number": satir_numarasi,
+                "severity": seviye,
                 "recommendation": cozum_onerisi,
             }
         )

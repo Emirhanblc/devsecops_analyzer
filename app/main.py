@@ -12,6 +12,7 @@ from . import models
 from .database import engine, get_db
 from .services.analyzer import analyze_code_chunk_async
 from .services.github import download_repo
+from .services.ignore import IgnoreRules, filter_findings, filter_source_files
 from .services.parser import chunk_code, get_code_files_from_repo
 
 # Modellerde tanımlanan veritabanı tablolarını, henüz yoklarsa oluşturuyoruz.
@@ -105,7 +106,12 @@ async def analyze_repository(
         extracted_folder_path = await run_in_threadpool(
             download_repo, request.github_url
         )
+        extract_root = Path(extracted_folder_path)
+        ignore_rules = IgnoreRules.load([extract_root])
+        name_root = ignore_rules.root if ignore_rules.enabled else extract_root
         source_files = get_code_files_from_repo(extracted_folder_path)
+        source_files, _skipped = filter_source_files(source_files, ignore_rules)
+        contents_by_relative: dict[str, str] = {}
         tasks = []
 
         # Groq sunucuları hızlı olduğu için aynı anda en fazla 5 analiz
@@ -124,9 +130,13 @@ async def analyze_repository(
         # asyncio.gather çağrısında başlatılacak, ancak semafor sayesinde aynı anda
         # en fazla 5 tanesi Groq API'ye istek gönderecek.
         for file_path, file_content in source_files.items():
-            relative_file_name = Path(file_path).relative_to(
-                Path(extracted_folder_path)
-            ).as_posix()
+            try:
+                relative_file_name = Path(file_path).resolve().relative_to(
+                    name_root.resolve()
+                ).as_posix()
+            except ValueError:
+                relative_file_name = Path(file_path).as_posix().replace("\\", "/")
+            contents_by_relative[relative_file_name] = file_content
             character_offset = 0
 
             for code_part in chunk_code(file_content):
@@ -150,6 +160,9 @@ async def analyze_repository(
         all_vulnerabilities = []
         for findings in results:
             all_vulnerabilities.extend(findings)
+        all_vulnerabilities = filter_findings(
+            all_vulnerabilities, ignore_rules, contents_by_relative
+        )
 
         # Analiz tamamlandıktan sonra bütün bulguları tek işlem içinde
         # veritabanına ekliyoruz. Böylece commit başarısız olursa yarım kayıt

@@ -1,0 +1,7 @@
+# DevSecOps Analyzer ignore listesi (gitignore benzeri).
+# Dosya kalıbı eşleşirse o dosya Groq'a gönderilmez.
+# `dosya.py:42` veya `dosya.py:10-20` yalnızca o satırlardaki bulguları eler.
+# Kaynakta `# devsecops:ignore` olan satırlar da atlanır.
+
+# Kasıtlı SQL Injection örneği. Yalnızca `python scan.py --fixture` tarar.
+test_vuln.py

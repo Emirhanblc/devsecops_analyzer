@@ -14,11 +14,13 @@ kırmızıya düşer.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, Optional
 
+import typer
 from dotenv import load_dotenv
 
 
@@ -33,6 +35,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # Beş paralel istek bu limiti aşıp 429 üretiyor; iki istek sınırın altında kalır.
 MAX_CONCURRENT = 2
 REQUEST_DELAY_SECONDS = 2
+VALID_LEVELS = ("critical", "high")
 
 
 def fail(message: str, code: int = 2) -> NoReturn:
@@ -41,26 +44,30 @@ def fail(message: str, code: int = 2) -> NoReturn:
     raise SystemExit(code)
 
 
-def parse_mode(argv: list[str]) -> str:
-    """`app` varsayılan taramadır. `--fixture` yalnızca test_vuln.py bakar."""
-    args = argv[1:]
-    if not args:
-        return "app"
-    if args == ["--fixture"]:
-        return "fixture"
-    fail(
-        f"Bilinmeyen argüman: {' '.join(args)}. "
-        "Kullanım: python scan.py [--fixture]"
-    )
+def github_line(value: object) -> str:
+    """GitHub Actions açıklaması için satır numarasının ilk rakamlarını alır."""
+    from app.services.ignore import parse_line_number
+
+    return str(parse_line_number(value))
 
 
-def collect_source_files(mode: str) -> dict[str, str]:
+def relative_name(file_path: str, root: Path = PROJECT_ROOT) -> str:
+    """Mutlak yolu raporlarda görünen göreli yola çevirir."""
+    resolved = Path(file_path).resolve()
+    try:
+        return resolved.relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return resolved.as_posix().replace("\\", "/")
+
+
+def collect_source_files(mode: str, scan_path: Path | None) -> dict[str, str]:
     """
     Taranacak kaynak dosyalarını toplar.
 
     Varsayılan modda temp_repos, test_vuln.py ve diğer kök scriptler
     alınmaz. Yalnızca uygulama kodu (app/) ve scan.py taranır.
     Fixture modu tek dosyaya bakar: test_vuln.py.
+    `--path` verilirse yalnızca o dizin taranır.
     """
     if mode == "fixture":
         fixture = PROJECT_ROOT / "test_vuln.py"
@@ -70,6 +77,13 @@ def collect_source_files(mode: str) -> dict[str, str]:
 
     from app.services.parser import get_code_files_from_repo
 
+    if scan_path is not None:
+        target = scan_path.expanduser().resolve()
+        if not target.is_dir():
+            fail(f"Tarama yolu bir dizin değil veya bulunamadı: {scan_path}")
+        source_files = get_code_files_from_repo(str(target))
+        return source_files
+
     source_files = get_code_files_from_repo(str(PROJECT_ROOT / "app"))
     scan_py = PROJECT_ROOT / "scan.py"
     try:
@@ -78,22 +92,6 @@ def collect_source_files(mode: str) -> dict[str, str]:
         print(f"Uyarı: {scan_py} okunamadı: {error}", flush=True)
 
     return source_files
-
-
-def relative_name(file_path: str) -> str:
-    """Mutlak yolu raporlarda görünen göreli yola çevirir."""
-    return Path(file_path).resolve().relative_to(PROJECT_ROOT).as_posix()
-
-
-def github_line(value: object) -> str:
-    """GitHub Actions açıklaması için satır numarasının ilk rakamlarını alır."""
-    digits = ""
-    for character in str(value):
-        if character.isdigit():
-            digits += character
-        elif digits:
-            break
-    return digits or "1"
 
 
 def is_sql_injection(finding: dict) -> bool:
@@ -112,20 +110,61 @@ def is_sql_injection(finding: dict) -> bool:
     return has_sql and has_injection
 
 
-async def run_scan(mode: str) -> tuple[list[dict], list[str]]:
+def filter_by_level(findings: list[dict], level: str) -> list[dict]:
+    """`--level critical` yalnızca kritik bulguları bırakır."""
+    if level == "high":
+        return findings
+    kept: list[dict] = []
+    for finding in findings:
+        severity = str(
+            finding.get("severity") or finding.get("seviye") or "high"
+        ).strip().lower()
+        if severity == "critical":
+            kept.append(finding)
+    return kept
+
+
+def contents_by_relative(source_files: dict[str, str], root: Path) -> dict[str, str]:
+    return {
+        relative_name(file_path, root): content
+        for file_path, content in source_files.items()
+    }
+
+
+async def run_scan(
+    mode: str,
+    scan_path: Path | None,
+    apply_ignore: bool,
+) -> tuple[list[dict], list[str], dict[str, str], int]:
     """Kaynak dosyaları parçalayıp Groq analizörüne gönderir."""
     from app.services.analyzer import analyze_code_chunk_async
+    from app.services.ignore import IgnoreRules, filter_findings, filter_source_files
     from app.services.parser import chunk_code
 
-    source_files = collect_source_files(mode)
+    source_files = collect_source_files(mode, scan_path)
+    if apply_ignore:
+        rules = IgnoreRules.load([PROJECT_ROOT])
+        source_files, skipped = filter_source_files(source_files, rules)
+        if skipped:
+            print(
+                f"Ignore: {len(skipped)} dosya atlandı (.devsecopsignore)",
+                flush=True,
+            )
+    else:
+        rules = IgnoreRules.none(PROJECT_ROOT)
+
     if not source_files:
         fail("Taranacak kaynak kod dosyası bulunamadı.")
 
     label = "fixture (test_vuln.py)" if mode == "fixture" else "uygulama kodu"
+    if scan_path is not None and mode != "fixture":
+        label = relative_name(str(scan_path.resolve()))
     print(f"Tarama modu: {label}", flush=True)
     print(f"Taranacak dosya sayısı: {len(source_files)}", flush=True)
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    relative_root = rules.root if rules.enabled else PROJECT_ROOT
+    relative_contents = contents_by_relative(source_files, relative_root)
 
     async def analyze_with_semaphore(chunk: str, file_name: str) -> list:
         async with semaphore:
@@ -134,7 +173,7 @@ async def run_scan(mode: str) -> tuple[list[dict], list[str]]:
 
     tasks = []
     for file_path, file_content in source_files.items():
-        file_name = relative_name(file_path)
+        file_name = relative_name(file_path, relative_root)
         print(f"  - {file_name}", flush=True)
         for code_part in chunk_code(file_content):
             tasks.append(analyze_with_semaphore(code_part, file_name))
@@ -148,7 +187,9 @@ async def run_scan(mode: str) -> tuple[list[dict], list[str]]:
             errors.append(str(item))
         else:
             findings.extend(item)
-    return findings, errors
+
+    findings = filter_findings(findings, rules, relative_contents)
+    return findings, errors, relative_contents, len(source_files)
 
 
 def print_report(findings: list[dict], *, annotate_errors: bool) -> None:
@@ -173,8 +214,9 @@ def print_report(findings: list[dict], *, annotate_errors: bool) -> None:
             or finding.get("cozum_onerisi")
             or "Manuel inceleme yapın."
         )
+        severity = finding.get("severity") or finding.get("seviye") or "high"
 
-        print(f"{index}. {name}", flush=True)
+        print(f"{index}. {name} [{severity}]", flush=True)
         print(f"   Dosya : {file_name}", flush=True)
         print(f"   Satır : {line_number}", flush=True)
         print(f"   Çözüm : {suggestion}\n", flush=True)
@@ -186,6 +228,19 @@ def print_report(findings: list[dict], *, annotate_errors: bool) -> None:
                 f"::error file={file_name},line={github_line(line_number)}::{name} — {suggestion}",
                 flush=True,
             )
+
+
+def export_json(path: Path, findings: list[dict], scanned_file_count: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "taranan_dosya_sayisi": scanned_file_count,
+        "bulgular": findings,
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"JSON yazıldı: {path}", flush=True)
 
 
 def finish(mode: str, findings: list[dict], errors: list[str]) -> None:
@@ -232,12 +287,51 @@ def finish(mode: str, findings: list[dict], errors: list[str]) -> None:
     print("Pipeline başarılı: güvenlik taraması temiz.", flush=True)
 
 
-def main() -> None:
+def main(
+    path: Optional[Path] = typer.Option(
+        None,
+        "--path",
+        help="Taranacak dizin. Varsayılan: app/ ve scan.py.",
+    ),
+    level: str = typer.Option(
+        "high",
+        "--level",
+        help="critical veya high. high, her iki seviyeyi de içerir.",
+    ),
+    export_json_path: Optional[Path] = typer.Option(
+        None,
+        "--export-json",
+        help="Bulguları JSON dosyasına yaz.",
+    ),
+    export_sarif_path: Optional[Path] = typer.Option(
+        None,
+        "--export-sarif",
+        help="Bulguları SARIF 2.1.0 dosyasına yaz.",
+    ),
+    fixture: bool = typer.Option(
+        False,
+        "--fixture",
+        help="Yalnızca test_vuln.py dosyasını tara.",
+    ),
+    comment_pr: bool = typer.Option(
+        False,
+        "--comment-pr",
+        help="Pull request varsa GitHub yorumu yaz veya güncelle.",
+    ),
+) -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-    mode = parse_mode(sys.argv)
+    if fixture and path is not None:
+        fail("--path ve --fixture birlikte kullanılamaz.")
+
+    if path is not None and not path.expanduser().is_dir():
+        fail(f"Tarama yolu bir dizin değil veya bulunamadı: {path}")
+
+    normalized_level = level.strip().lower()
+    if normalized_level not in VALID_LEVELS:
+        fail(f"--level {level!r} geçersiz. Kullanım: critical veya high.")
 
     if not os.getenv("GROQ_API_KEY"):
         fail(
@@ -245,10 +339,31 @@ def main() -> None:
             "Yerelde .env dosyasını, GitHub'da ise repository secret'ını kontrol edin."
         )
 
-    findings, errors = asyncio.run(run_scan(mode))
+    mode = "fixture" if fixture else "app"
+    findings, errors, _contents, scanned_file_count = asyncio.run(
+        run_scan(mode, path, apply_ignore=(mode != "fixture"))
+    )
+    if mode != "fixture":
+        findings = filter_by_level(findings, normalized_level)
+
+    if export_json_path is not None:
+        export_json(export_json_path, findings, scanned_file_count)
+    if export_sarif_path is not None:
+        from app.services.sarif import write_sarif
+
+        write_sarif(export_sarif_path, findings)
+        print(f"SARIF yazıldı: {export_sarif_path}", flush=True)
+    if comment_pr and mode != "fixture":
+        from app.services.pr_comment import maybe_comment_on_pull_request
+
+        maybe_comment_on_pull_request(findings, scanned_file_count)
+
     print_report(findings, annotate_errors=(mode != "fixture"))
     finish(mode, findings, errors)
 
 
 if __name__ == "__main__":
-    main()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    typer.run(main)
