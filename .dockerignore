@@ -1,0 +1,22 @@
+# Gizli anahtarlar Docker build context'ine gönderilmemelidir.
+.env
+.env.*
+
+# İndirilen repolar uygulama imajının parçası değildir.
+temp_repos/
+
+# Yerel geliştirme ve önbellek dosyaları.
+.git/
+.gitignore
+.idea/
+.vscode/
+.cursor/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Yerel sanal ortamlar ve günlükler.
+.venv/
+venv/
+*.log

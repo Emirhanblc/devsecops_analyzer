@@ -1,0 +1,55 @@
+# =============================================================================
+# GitHub Actions iş akışı (workflow)
+# Bu dosya, her kod gönderiminde güvenlik taramasını GitHub sunucularında
+# otomatik olarak çalıştırır. Yerelde "python scan.py" demek yerine
+# pipeline bu işi sizin yerinize yapar.
+# =============================================================================
+
+# name: GitHub arayüzünde (Actions sekmesinde) görünen iş akışı başlığıdır.
+name: DevSecOps Güvenlik Taraması
+
+# on: Bu iş akışının NE ZAMAN çalışacağını belirler.
+# Aşağıdaki iki olaydan herhangi biri olduğunda tarama başlar.
+on:
+  # push: Herhangi bir dala kod gönderildiğinde (git push) tetiklenir.
+  push:
+  # pull_request: Bir pull request açıldığında veya güncellendiğinde tetiklenir.
+  pull_request:
+
+# jobs: İş akışındaki işleri (job) listeler. Bir iş, bir sanal makinede
+# sırayla çalışan adımlar bütünüdür.
+jobs:
+  # security_scan: Bu işin benzersiz kimliğidir. Loglarda bu isimle görünür.
+  security_scan:
+    # runs-on: İşin hangi işletim sisteminde çalışacağını seçer.
+    # ubuntu-latest, GitHub'ın sağladığı güncel Ubuntu sanal makinesidir.
+    runs-on: ubuntu-latest
+
+    # steps: Bu işin içinde sırayla çalışacak komut / eylem listesidir.
+    # Adımlar yukarıdan aşağıya, bir önceki başarılı olduktan sonra çalışır.
+    steps:
+      # 1. Adım: Depodaki kodları sanal makineye indirir.
+      # actions/checkout@v4, resmi GitHub eylemidir; v4 kararlı sürümüdür.
+      - name: Kodları Çek
+        uses: actions/checkout@v4
+
+      # 2. Adım: Python'u kurar ve PATH'e ekler.
+      # python-version: 3.10, tarayıcının beklediği sürümü sabitler.
+      - name: Python Ortamını Kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # 3. Adım: requirements.txt içindeki Python paketlerini yükler.
+      # run: sanal makinenin terminalinde çalıştırılacak komuttur.
+      - name: Bağımlılıkları Yükle
+        run: pip install -r requirements.txt
+
+      # 4. Adım: Yerel tarama scriptini CI ortamında çalıştırır.
+      # env: Bu adıma özel ortam değişkenleridir.
+      # secrets.GROQ_API_KEY, GitHub deposundaki gizli değişkenden gelir.
+      # Anahtar asla YAML içine yazılmaz; Actions loglarında da gizlenir.
+      - name: Güvenlik Taramasını Çalıştır
+        run: python scan.py
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
